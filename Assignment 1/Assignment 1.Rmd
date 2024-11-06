@@ -1,0 +1,588 @@
+---
+---
+---
+
+# Assignment 1
+
+### Noah Zeidenberg
+
+### ID: 1048535
+
+### 17-09-2024
+
+------------------------------------------------------------------------
+
+### Introduction
+
+The subfamily Ennominae, belonging to the family Geometridae, represents one of the most diverse groups of moths, with a vast array of species exhibiting significant morphological and ecological variation (Beljaev, 2006). Understanding the biodiversity within this group is crucial for insights into evolutionary relationships, species delimitation, and conservation efforts. The Barcode of Life Data System (BOLD) offers an extensive repository of DNA barcode sequences that can be utilized to explore genetic diversity and species boundaries within taxonomic groups (Ratnasingham & Herbert, 2013). Moreover, the categorization of sequences is based on sequence similarity, rather than morphological traits.
+
+#### Research Question
+
+*How does genetic variation among the most frequently sampled species and Barcode Index Numbers (BINs) within the Ennominae subfamily reflect its biodiversity (or lack thereof), and what insights can be gained about species delineation and potential cryptic diversity through sequence alignment and principal component analysis?*
+
+#### Objectives
+
+To address this **exploratory question**, I will focus on:
+
+1.  **Analyzing Species and BIN Summary Statistics:**
+
+Generating frequency plots for species and BINs to understand the sampling distribution within the Ennominae subfamily in the BOLD database.
+
+2.  **Multiple Sequence Alignment (MSA):\
+    **
+
+    a\. Performing MSA on the 15 species with the highest number of sequence entries to assess intraspecific genetic variation.
+
+    b\. Conducting MSA on 15 BINs to evaluate genetic divergence and potential cryptic species across BINs.\
+
+3.  **Principal Component Analysis (PCA):**
+
+Applying PCA on the majority of the Ennominae sequence dataset to explore variance in sequence structure and visualize relationships among sequences and BINs.
+
+#### Load libraries
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(install.packages.ask = FALSE)
+set.seed(18)
+library("pacman") # pacman automatically checks if a package is installed and (if not, installs it then) loads it into the current environment
+pacman::p_load("bold",
+               "dplyr", # for performing major dataframe selections/transformations/etc.
+               "tidyverse", # has numerous helpful functions I may use
+               "msa", # for performing and  multiple sequence alignments
+               "taxize", # works well with the bold package -> e.g. "downstream" fn reduces load on BOLD query
+               "purrr", # base lapply was throwing errors and a forum on stackexchange suggested I used the map function from purrr, which worked!
+               "progress", #progress bars so I can monitor the downstream() and bold_seqspec() functions' progress
+               "ggplot2", "ggrepel", "cowplot",
+               update = FALSE,
+               dependencies = TRUE) # ggplot2 for data visualization, ggrepel for neatness of geom_point labels, cowplot for assembling figures
+
+# Load BiocManager using pacman
+if (!requireNamespace("BiocManager", quietly = TRUE, ask = FALSE)) {
+  pacman::p_load(BiocManager)
+}
+# Install the Bioconductor package "Biostrings"
+BiocManager::install(c("ropensci/bold", "Biostrings", "YuLab-SMU/ggmsa")) # ggmsa is for plotting MSA as well as consensus sequence and sequence LOGO functions
+# Install the bold package from GitHub using pacman
+pacman::p_load_gh(c("ropensci/bold", "Biostrings", "YuLab-SMU/ggmsa"), update = TRUE, dependencies = TRUE)
+```
+
+#### Fetch data from BOLD
+
+First I will retrieve species-level sequence and species data from BOLD downstream from a greater taxon name. I made the function to do this generic, as I initially intended to apply my project to all of Lepidoptera, but in the end I was only able to apply it to the subfamily Ennominae.
+
+I was initially pulling Sequence + Species data from all Geometridae subfamilies via API calls, which I let run overnight. The rate limiting from BOLD was too great to do this, so instead I switched just to the subfamily Ennominae, since it was the largest within Geometridae. I also used the taxize::downstream() function since it has the 'start' parameter which meant I did not have to completely restart the call every time I lost the connection to BOLD.
+
+```{r}
+fn_getSeqSpec <- function(taxon) {
+    
+    # Create a file in order to save progress, so the API call isn't starting from 1 each time.
+    filename <- paste("Raw", taxon, "SeqSpec.tsv", sep = "_")
+
+    # Check if the file already exists (to resume progress)
+    if (file.exists(filename)) {
+        # Load previously saved data
+        df_Data_raw <- read_tsv(filename, col_types = cols())
+        ls_processed_species <- unique(df_Data_raw$species_name)
+    } else {
+        # Initialize an empty dataframe if no previous file
+        df_Data_raw <- data.frame()
+        ls_processed_species <- character()  # Use character() instead of list()
+    }
+
+    # Initialize "start" parameter of taxize::downstream()
+    start <- nrow(df_Data_raw)  # Set start based on the number of processed species
+
+    # Get species-level names downstream from any higher taxonomic level name (e.g. Drosophila, Insecta, Animalia, etc.)
+    df_downstream <- taxize::downstream(taxon, db = "bold", downto = "species", start = start)
+    ls_species_names <- df_downstream[[1]][, 1]
+
+    # Filter out species that have already been processed
+    ls_species_names <- dplyr::setdiff(ls_species_names, ls_processed_species)
+    
+    # Initialize progress bar
+    pb <- progress_bar$new(
+        format = "  Querying BOLD [:bar] :percent in :elapsed",
+        total = length(ls_species_names), clear = TRUE, width = 60)
+
+    # Get sequence and species data for each species in the list
+    for (species_name in ls_species_names) {
+        # Progress bar update
+        pb$tick()
+
+        # Query the sequence and species info from BOLD
+        query_seqspec <- bold::bold_seqspec(species_name)
+
+        # Check that BOLD returned an entry, otherwise it will throw an error so skip
+        if (is.data.frame(query_seqspec) && nrow(query_seqspec) > 0) {
+            result <- query_seqspec[, c("species_name",
+                                         "bin_uri", 
+                                         "genus_name",
+                                         "subfamily_name",
+                                         "family_name", 
+                                         "order_name",
+                                         "country",
+                                         "nucleotides")]
+            
+            # Ensure consistent column types before combining
+            common_cols <- intersect(names(df_Data_raw), names(result))
+            for (col in common_cols) {
+                df_Data_raw[[col]] <- as.character(df_Data_raw[[col]])
+                result[[col]] <- as.character(result[[col]])
+            }
+
+            # Append new result to the existing data
+            df_Data_raw <- bind_rows(df_Data_raw, result)
+
+        } else {
+            # Skip entries that don't return data in an appropriate format (e.g. NULL)
+            print(paste("Warning: entry for species '", species_name, "' not found. Skipping.", sep = ""))
+            
+            # Add an empty row to keep length(ls_species_names) consistent with use of downstream() "start" param
+            empty_row <- rep(NA, ncol(df_Data_raw)) %>%
+                            t() %>%
+                            as.data.frame(stringsAsFactors = FALSE)
+            colnames(empty_row) <- colnames(df_Data_raw)
+            empty_row$species_name <- species_name
+            df_Data_raw <- bind_rows(df_Data_raw, empty_row)
+
+            # Skip to next species_name for efficient use of compute time
+            next
+        }
+
+        # Save progress after each species is processed
+        write_tsv(df_Data_raw, filename)
+
+        # Wait for a few (1-3) seconds between API calls to reduce risk of rate-limiting from BOLD
+        Sys.sleep(sample(1:3, 1))
+    }
+
+    # Return the complete dataframe
+    return(df_Data_raw)
+}
+```
+
+Rather than run downstream() and bold_seqspec() each time I needed the .tsv file, I saved it once and loaded it. However, I wanted to design the code to run in one go, rather than manually run each block. As such, I included a statement to run my previously defined function only if the .tsv file doesn't yet exist. In the case that the API call cut out part-way through, I did just manually run it again, as it starts from where it last left off even if the R session restarts.
+
+```{r}
+if (!file.exists("./Raw_Ennominae_SeqSpec.tsv")){
+  fn_getSeqSpec(taxon = "Ennominae") # Get Ennominae downstream. This creates the tsv file
+}
+
+df_Data_raw <- read_tsv(file = "./Raw_Ennominae_SeqSpec.tsv", col_names = TRUE, show_col_types = FALSE)
+```
+
+Prior to calculating descriptive statistics such as species or BIN frequency distributions the data must be cleaned of erratic rows.
+
+```{r}
+# Remove ambiguities ('N' or gaps).  Adapted from "CLASS 8 SOFTWARE TOOLS - INTRODUCTION TO BIOSTRINGS AND K-MERS" Cottenie, K. (2024-09-29)
+df_Data <- df_Data_raw %>%
+  filter(!is.na(nucleotides), !is.na(bin_uri)) %>% # remove rows where nucleotide or bin_uri are NA
+  mutate(nucleotides2 = Biostrings::replaceAmbiguities(nucleotides, "N")) %>%  # Replace ambiguous bases (such as '.' or 'Y', which I occasionally saw in a preliminary look at the data) with 'N'
+  mutate(nucleotides2 = str_replace_all(nucleotides2, "N", "-")) %>%  # Replace all 'N' with gaps
+  mutate(nucleotides2 = str_remove(nucleotides2, "^[-]+")) %>%  # Remove leading gaps
+  mutate(nucleotides2 = str_remove(nucleotides2, "[-]+$")) %>%  # Remove trailing gaps
+  mutate(nucleotides2 = str_replace_all(nucleotides2, "-+", "")) %>%  # Remove consecutive gaps
+  filter(str_count(nucleotides2) > 499) %>% # Filtering out sequences under 500 bp
+  subset(select = -nucleotides) %>% # Remove original nucleotide column from new df
+  unique() # Remove duplicates
+
+# Ensure that the nucleotides2 column is character
+df_Data$nucleotides2 <- as.character(df_Data$nucleotides2)
+
+df_Data %>% head(n=1) # Visually inspect the first row
+```
+
+### Calculate and plot frequency distribution
+
+For asthetics sake I have chosen 15 species (Figure 1a) and 15 BINs (Figure 1c) to plot frequency data from, any more than that and the plots became overly busy. Moreover, a significant proportion of the species and BINs had fewer than 3 entries. I showcase this in Figure 1b and Figure 1d, which show all species and BINs, respectively, with any groups having fewer than 3 entries being grouped in "Other".
+
+```{r}
+# Count number of unique species
+unique_species_count <- length(unique(df_Data$species_name)) 
+
+# Count number of unique bins
+unique_bin_count <- length(unique(df_Data$bin_uri)) 
+
+# Frequency table for each species
+species_freq <- table(df_Data$species_name) 
+
+# Frequency table for each BIN
+bin_freq <- table(df_Data$bin_uri) 
+
+# Group together if there are fewer than 3 entries under a species name
+species_counts <- df_Data %>% 
+  group_by(species_name) %>%
+  summarise(count = n()) %>%
+  mutate(category = ifelse(count < 3, "Others", as.character(species_name))) # if there's less than 3 of a species group it with "Other"
+
+# Merge "Others" category back into the original dataframe for species
+df_Data$species_category <- species_counts$category[match(df_Data$species_name, species_counts$species_name)]
+
+
+# Display only the top 15 species
+top_n_species <- 15  # Adjust this number as needed
+top_species <- species_counts %>%
+  arrange(desc(count)) %>%
+  head(top_n_species) %>%
+  pull(species_name)
+
+# Group bin_uri and count frequencies, categorizing those with fewer than 3 entries as 'Others'
+bin_counts <- df_Data %>%
+  group_by(bin_uri) %>%
+  summarise(count = n()) %>%
+  mutate(category = ifelse(count < 3, "Others", as.character(bin_uri)))
+
+# Get the top 15 bin_uri's
+top_n_bins <- 15  # Adjust this number as needed
+top_bins <- bin_counts %>%
+  head(top_n_bins) %>%
+  pull(bin_uri)
+
+# Filter the original dataframe to include only top species
+df_top <- df_Data %>%
+  filter(species_name %in% top_species)
+
+# Filter the original dataframe to include only top bin_uri's
+df_top_bins <- df_Data %>%
+  filter(bin_uri %in% top_bins)
+
+# Merge 'Others' category back into the original dataframe for BINs
+df_Data$bin_category <- bin_counts$category[match(df_Data$bin_uri, bin_counts$bin_uri)]
+
+```
+
+```{r}
+# Generate plots for Figure 1
+
+p1_spec_top <- ggplot(df_top, aes(x = species_name)) +
+  geom_bar(fill = "gold") +
+  theme(text = element_text(size = 8),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(title = "Species Frequency Distribution", subtitle = "15 highest # of Entries",
+         x = "Species Name", y = "Count")
+
+p1_spec_total <- ggplot(df_Data, aes(x = species_category)) +
+  geom_bar(fill = "darkgreen") +
+  theme(text = element_text(size = 8),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(title = "Distribution of Species Frequency", subtitle = "Species with 1-2 entries are categorized as 'Other'", x = "Species Name", y = "Count")
+
+# Plot the distribution of the top 10 bin_uri's
+p1_bin_top <- ggplot(df_top_bins, aes(x = bin_uri)) +
+  geom_bar(fill = "lightpink") +
+  theme(text = element_text(size = 8),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(title = "BIN_URI Frequency Distribution", subtitle = "15 highest # of Entries",
+       x = "BIN URI", y = "Count")
+
+# Create the plot for bin_uri frequency distribution with 'Others' category
+p1_bin_total <- ggplot(df_Data, aes(x = bin_category)) +
+  geom_bar(fill = "steelblue") +
+  theme(text = element_text(size = 6),
+        axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(title = "Distribution of BIN URI Frequency",
+       subtitle = "BIN URIs with 1-2 entries are categorized as 'Others'",
+       x = "BIN URI", y = "Count")
+
+# Arrange all four plots in a grid and label them A, B, C, and D
+cowplot::plot_grid(p1_spec_top, p1_spec_total, p1_bin_top, p1_bin_total,
+        nrow = 2,
+        ncol = 2,
+        labels = c('A', 'B', 'C', 'D'), label_size = 8)
+```
+
+### Perform Multiple-Sequence Alignment, and plot
+
+I chose to use the Muscle algorithm in MSA rather than ClustalW or Clustal Omega because it has been shown to perform significantly better (specifically, it is more accurate) for sequences with significant indels (Pervez *et al.,* 2014). In future iterations of this project I would use the T-Coffee algorithm which has shown better performance even than Muscle, but I could not get it to work in time for the project due date.
+
+| Muscle | Clustal |
+|------------------------------------|------------------------------------|
+| \< 1000 Sequences | \> 2000 Sequences |
+| Performs poorly on sequences with low homology | Performs poorly on sequences with many indels |
+| Slower | Faster (with multi-threading option) |
+
+First, I will perform MSA on 15 sample species from Ennominae (see Fig 2a).
+
+```{r warning = FALSE}
+
+# Again, first ensuring nucleotides2 is a character vector
+df_Data$nucleotides2 <- as.character(df_Data$nucleotides2)
+
+# Select one sequence per species
+df_unique <- df_Data %>%
+  group_by(species_name) %>%
+  dplyr::slice(1) %>%   # Select the first sequence for each species
+  ungroup()
+
+# Convert sequences to DNAStringSet
+sequences <- Biostrings::DNAStringSet(df_unique$nucleotides2)
+
+# Assign species names to sequences
+names(sequences) <- df_unique$species_name
+
+# Limit to first 15 sequences for MSA, for aesthetics sake.
+sequences <- sequences[1:15]
+
+# Perform MSA using MUSCLE
+alignment <- msa::msa(sequences, method = "Muscle", gapOpening = 10, gapExtension = 0.5)
+
+# Convert alignment back to to DNAStringSet for ggmsa()
+aligned_sequences <- as(alignment, "DNAStringSet")
+
+# Create a subset for the plot (first 15 unique species)
+aligned_subset <- aligned_sequences[1:15]
+
+# Create the ggmsa plot
+p2_species_MSA <- ggmsa::ggmsa(aligned_subset, 
+                    start = 60,
+                    end = 120, 
+                    char_width = 0.7, 
+                    seq_name = TRUE) +
+                      geom_seqlogo() +  # Display sequence conservation
+                      theme(axis.text = element_text(size = 6),
+                            axis.title = element_text(size = 8, face = "bold")) +
+                      labs(title = "Multiple Sequence Alignment of 15 Unique Species", 
+                           x = "Position",
+                         y = "Species Name") + 
+                    geom_msaBar()
+
+# Save p2_species_MSA
+ggsave(
+  filename = "p2_species_MSA.png",
+  plot = p2_species_MSA,
+  width = 15,      # Width
+  height = 11,     # Height
+  dpi = 800,      # High resolution
+  units = "cm",
+  bg = "transparent"  # Optional: Makes background transparent
+)
+
+# Create cowplot objects from the images
+species_msa_img <- ggdraw() + 
+  draw_image("./p2_species_MSA.png", scale = 1.1)
+
+```
+
+Now I will perform MSA on 15 sample BINs (See Fig 2b).
+
+```{r warning = FALSE}
+# MSA plot of 15 BIN sequences
+
+# Ensure nucleotides2 is a character vector
+df_Data$nucleotides2 <- as.character(df_Data$nucleotides2)
+
+# Select one species per bin_uri
+
+df_bins <- df_Data %>%
+          group_by(bin_uri) %>%
+          summarize(
+            unique_species = n_distinct(species_name),
+            total_sequences = n()
+          ) %>%
+          arrange(total_sequences)
+
+# select first 15 sequences
+top_15_bins <- df_bins$bin_uri[1:15]
+
+df_subset <- df_Data[df_Data$bin_uri %in% top_15_bins, ]
+
+# Convert sequences to DNAStringSet
+sequences <- DNAStringSet(df_subset$nucleotides2)
+
+# Assign species names to sequences
+names(sequences) <- df_subset$bin_uri  # Ensure this is correct
+
+# Perform MSA using MUSCLE
+bin_alignment <- msa(sequences, method = "Muscle", gapOpening = 10, gapExtension = 0.5)
+
+# Convert alignment to DNAStringSet
+aligned_sequences <- as(bin_alignment, "DNAStringSet")
+
+# Create the ggmsa plot
+p2_BIN_MSA <- ggmsa(aligned_sequences, 
+                start = 60, 
+                end = 120, 
+                char_width = 0.7, 
+                seq_name = TRUE) +
+          geom_seqlogo() +  # Display sequence conservation
+          theme(axis.text = element_text(size = 6),
+                axis.title = element_text(size = 8, face = "bold")) +
+          labs(title = "Multiple Sequence Alignment of 15 Unique BINs", 
+               x = "Position",
+               y = "BIN number") +
+          geom_msaBar()
+
+# Save p2_BIN_MSA
+# Save p2_BIN_MSA with tight dimensions
+ggsave(
+  filename = "p2_BIN_MSA.png",
+  plot = p2_BIN_MSA,
+  width = 15,
+  height = 11,
+  dpi = 800,
+  units = "cm",
+  bg = "transparent"
+)
+# Create cowplot objects from the images
+bin_msa_img <- ggdraw() + 
+  draw_image("./p2_BIN_MSA.png", scale = 1.1)
+
+
+# Arrange the two images in a single column with labels A and B
+combined_plot <- plot_grid(
+  species_msa_img, 
+  bin_msa_img,
+  ncol = 2,
+  labels = c('A', 'B'),
+  label_size = 9, 
+  label_fontface = "bold"
+)
+
+# Display the plot for Figure 2
+print(combined_plot)
+```
+
+------------------------------------------------------------------------
+
+Lastly in my analysis I will perform PCA on the first 500 sequences in Ennominae, to see how species/BINs compare in their sequence variability, as well as which species/BINs are clustered together and which appear distinct from the rest.
+
+```{r warning = FALSE}
+# Function to one-hot encode a DNA sequence
+fn_one_hot_encode <- function(sequence) {
+  # Convert the sequence to character vector
+  nucleotides <- strsplit(as.character(sequence), "")[[1]]
+  encoded_matrix <- sapply(nucleotides, function(base) {
+    switch(base,
+           "A" = c(1, 0, 0, 0),
+           "C" = c(0, 1, 0, 0),
+           "G" = c(0, 0, 1, 0),
+           "T" = c(0, 0, 0, 1),
+           "-" = c(0, 0, 0, 0),  # Gaps as zeroes
+           c(0, 0, 0, 0))  # Default for any unknown character
+  })
+  return(as.vector(t(encoded_matrix)))  # Flatten to a single vector
+}
+
+# Display the top 500 species
+top_n <- 500 # Adjust this number as needed
+top_species <- species_counts %>%
+  arrange(desc(count)) %>%
+  head(top_n) %>%
+  pull(species_name)
+
+# Filter the original dataframe to include only top species
+df_top <- df_Data %>%
+  filter(species_name %in% top_species)
+
+# Find the minimum length in the sequences
+min_length <- min(width(df_top$nucleotides2))
+sequences <- stringr::str_trunc(df_top$nucleotides2, width = min_length)
+sequences <- Biostrings::DNAStringSet(sequences)
+
+names(sequences) <- paste0(df_top$species_name, "_", seq_along(sequences)) # assign unique name for MSA
+
+# Apply one-hot encoding to all sequences
+encoded_sequences <- lapply(as.character(sequences), fn_one_hot_encode)
+
+# Combine into a matrix for PCA (rows = sequences, columns = flattened one-hot encoding)
+pca_input_matrix <- do.call(rbind, encoded_sequences)
+
+# Remove constant columns (all zeros or all the same value)
+pca_input_matrix <- pca_input_matrix[, apply(pca_input_matrix, 2, var) > 0]
+
+# Run PCA
+pca_result <- prcomp(pca_input_matrix, scale. = TRUE)
+
+# Create a dataframe from PCA results
+pca_df <- as.data.frame(pca_result$x)
+
+# Add species_name and bin_uri
+pca_df[, c("species_name", "bin_uri")] <- df_top[, c("species_name", "bin_uri")]
+
+# Identify unique bins
+unique_bins <- unique(pca_df$bin_uri)
+num_bins <- length(unique_bins)
+
+# Generate a high-contrast qualitative color palette
+custom_colors <- colorspace::qualitative_hcl(n = num_bins, palette = "Dynamic")
+names(custom_colors) <- unique_bins  # Assign names to colors based on bin_uri
+
+# Convert 'bin_uri' to a factor for consistent coloring
+pca_df$bin_uri <- factor(pca_df$bin_uri, levels = unique_bins)
+
+# Plotting with colors by bin_uri
+ggplot(pca_df, aes(x = PC1, y = PC2, color = bin_uri)) +
+  geom_point(alpha = 1, size = 1) +
+  ggrepel::geom_text_repel(
+    aes(label = species_name),
+    size = 3,
+    max.overlaps = 30,        # Allows ggrepel to handle all potential overlaps
+    box.padding = 0.35,        # Padding around the text
+    point.padding = 0.5       # Padding around the points
+  ) +  # Conditional labels
+  labs(title = "Figure 3: PCA of 500 DNA Sequences in Ennominae",
+       subtitle = "Coloured by BIN",
+       x = "Principal Component 1", 
+       y = "Principal Component 2",
+       color = "BIN URI") +  # Label for the legend
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_minimal() +
+  theme(legend.position = "none")
+  scale_color_manual(values = custom_colors, na.translate = FALSE) 
+```
+
+#### Discussion
+
+**Analyzing Species and BIN Summary Statistics:**
+
+My first objective was to assess the distribution of species in BINs under the Ennominae taxon. Figure 1 showcases how small even the largest BINs within Ennominae are in the BOLD database. Though there is one BIN (BOLD:AAG3461) with 213 sequences inside (Fig. 1d) they primarily belong to *Acanthovalva cinerascens* (Fig. 1a,b) This could indicate either a sampling bias towards this species or their higher abundance in nature (Lukic *et al.*, 2021). An opportunity for future work would be to use the bold::bold_specimens() function to acquire geographic data and investigate the geographical spread of Ennominae, which could affirm or disprove the theory that *Acanthovalva cinerascens* are more prevalent than other Ennominae species.
+
+Many of the BINs have fewer than 3 sequences, and most have fewer than 5 sequences (Fig. 1d). This suggests that while there is considerable species richness within the dataset, many species are underrepresented which may limit the comprehensive assessment of their genetic diversity. Moreover, a significant reason for BOLD's existence is to provide biodiversity researchers with the ability to fit an unknown sequence to a species or BIN or potential species. With most BINs having very few sequences, the implication is that either the sequences differ too greatly to enter the same BIN, or that many species under Ennominae are severely underrepresented.
+
+Aside from *Acanthovalva cinerascens*, *Acanthovalva inconspicuaria, Abraxas grossulariata, and Abaciscus costimacula* are the most abundant species in the dataset, with \~20-30 sequences each (Fig. 1a). Likewise, the BINs with the most species inside (besides BOLD:AAG3461) were BOLD:AAB5956, BOLD:ABU5847 and BOLD:AAC2560, with 13-34 sequences per BIN (Fig. 1c,d).
+
+**Multiple Sequence Alignment:**
+
+The MSA of 15 distinct species and 15 distinct BINs provides two main insights. First, indels are somewhat common in the COI sequence of Ennominae and second, that sequences differ not only across BINs but across all example species as well.
+
+Based on the consensus sequence for Fig. 2a, most species sequences differ by insertion or deletion events, whereas based on Fig. 2b, most BIN sequences differ by position- namely, positions 74, 77 and 87-99. However, only 15 sequences and BINs are represented in Figure 2. Were more sequences, more BINs, and a wider MSA window being compared, this very well might differ. As such it is not a formal conclusion I can make based on Figure 2 alone. Still, it guides potential further investigation on how the sequences differ. Some of this variability is displayed in PCA.
+
+**Principal Component Analysis:**
+
+The PCA plot illustrates the two main vectors of variance along the sequences in Ennominae. There is clear clustering for some BINs, however some sequences from separate BINs are placed closely, potentially challenging the decision of the BOLD algorithm. For example, one case of *Abraxas satoi, Abraxas grossulariatus,* and *Abraxas suspecta* are placed very together despite two having been assigned distinct BINs. Furthermore, another *Abraxas satoi* sequence is clustered on the other side of PC2 (magnitude difference of more than 40!) with *Acrasia crinita, Abraxas lugubris,* and *Abraxas pusilla* sequences. This difference in magnitude on PC2 for two *Abraxas satoi* sequences in the same BIN, entered under the same species name implies either very large genetic diversity within this species and this BIN, or that the sequence was entered under the wrong species name. However, since the BOLD algorithm assigned them to the same BIN, I would interpret this information as the BOLD algorithm finding a pattern in the sequences not captured by the variance shown in PC2. In other words, they are more alike than not, but the region of dissimilarity is significant enough to appear on PC2.
+
+Other species/BINs show a more dispersed pattern, such as *Acanthovalva cinerascens*, *Achrosis fulvaCT01* and the rest of their BIN cluster at (-20, 0), (18, -28) and (30, 24) as well as in the large cluster around (18, 5). This could represent genetic variation within species, a recent speciation event, or potential misidentifications within the dataset. Given how new most of the sequences are, and the public nature of BOLD, it is very possible that there are misidentifications in the dataset. This has significant implications for cryptic species within Ennominae, but without more species sequences (such as from NCBI, or private datasets) no conclusion can be made with any weight (Meier *et al.*, 2021).
+
+#### Acknowledgments
+
+I am grateful to Dr. Karl Cottenie and Brittany MacIntyre for their guidance in class. I received guidance from Coleman Olenick regarding rate limiting from BOLD, which I resolved by implementing the taxize package. I ran into hundreds (thousands?) of errors during the course of my project, the troubleshooting for which was supported extensively by googling. Some examples are:
+
+-   <https://stackoverflow.com/questions/25721884/how-should-i-deal-with-package-xxx-is-not-available-for-r-version-x-y-z-wa>
+
+-   <https://stackoverflow.com/questions/21560389/non-numeric-argument-to-binary-operator>
+
+-   <https://stackoverflow.com/questions/34838870/grid-arrange-from-gridextras-exiting-with-only-grobs-allowed-in-glist-afte>
+
+-   <https://stackoverflow.com/questions/28863412/error-using-arial-in-eps-figure-with-extrafont-package>
+
+...\
+\
+The list of which is so extensive I cannot even imagine including each example. I was also assisted in troubleshooting code by ChatGPT, though this sometimes caused more errors than it fixed. However, it helped me learn quite a few new functions I am excited about, for which I am very grateful.
+
+Lastly, I would like to thank my cat, Bonsai, for his comfort when my computer crashed and I had to essentially restart from the file I'd saved part-way through on the cloud, using my mothers computer. Bonsai is a good cat.
+
+#### References
+
+Beljaev, E.A. and Institute of Biology and Soil Science, Vladivostok, Russia (2006). A morphological approach to the Ennominae phylogeny (Lepidoptera, Geometridae).
+
+Lukic, D., Eberle, J., Thormann, J., Holzschuh, C., and Ahrens, D. (2021). Excluding spatial sampling bias does not eliminate oversplitting in DNA‐based species delimitation analyses. Ecology and Evolution *11*, 10327–10337. <https://doi.org/10.1002/ece3.7836.>
+
+Meier, R., Blaimer, B.B., Buenaventura, E., Hartop, E., Von Rintelen, T., Srivathsan, A., and Yeo, D. (2021). A re‐analysis of the data in Sharkey et al.’s (2021) minimalist revision reveals that BINs do not deserve names, but BOLD Systems needs a stronger commitment to open science. Cladistics *38*, 264–275. <https://doi.org/10.1111/cla.12489.>
+
+Pervez, M.T., Babar, M.E., Nadeem, A., Aslam, M., Awan, A.R., Aslam, N., Hussain, T., Naveed, N., Qadri, S., Waheed, U., et al. (2014). Evaluating the Accuracy and Efficiency of Multiple Sequence Alignment Methods. Evolutionary Bioinformatics *10*, EBO.S19199. <https://doi.org/10.4137/ebo.s19199.>
+
+Ratnasingham, S., and Hebert, P.D.N. (2013). A DNA-Based registry for all animal species: the Barcode Index Number (BIN) system. PLoS ONE *8*, e66213. <https://doi.org/10.1371/journal.pone.0066213.>
+
+Sarkhawas, F., and Kamat, R.K. (2012). A Comparative study of Multiple Sequence Alignment Tools to construct Phylogenetic Trees. International Conference in Recent Trends in Information Technology and Computer Science (ICRTITCS - 2012), 12–13.
